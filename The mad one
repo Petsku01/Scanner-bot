@@ -1,0 +1,291 @@
+import requests
+from bs4 import BeautifulSoup
+import re
+import time
+from datetime import datetime
+import threading
+import logging
+import json
+import tweepy
+import sqlite3
+from urllib.parse import urljoin
+import argparse
+import sys
+from random import choice, randint
+from flask import Flask, render_template, request
+import smtplib
+from email.mime.text import MIMEText
+import telegram
+import asyncio
+
+# Configure logging
+logging.basicConfig(
+    filename="keycode_bot.log",
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
+# Keycode patterns
+STEAM_PATTERN = r"[A-Z0-9]{5}-[A-Z0-9]{5}-[A-Z0-9]{5}"
+XBOX_PATTERN = r"[A-Z0-9]{5}-[A-Z0-9]{5}-[A-Z0-9]{5}-[A-Z0-9]{5}-[A-Z0-9]{5}"
+PSN_PATTERN = r"[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}"
+
+# Load config
+try:
+    with open("config.json", "r") as f:
+        CONFIG = json.load(f)
+except FileNotFoundError:
+    CONFIG = {
+        "seed_websites": ["https://www.reddit.com/r/FreeGameFindings/", "https://gg.deals/giveaways/"],
+        "aggregator_urls": ["https://www.giveawaylisting.com/"],
+        "x_keywords": ["#SteamGiveaway", "#XboxCode", "#PSNGiveaway"],
+        "base_scan_interval": 300,
+        "x_api": {"api_key": "", "api_secret": "", "access_token": "", "access_secret": ""},
+        "proxies": ["http://proxy1:port", "http://proxy2:port"],
+        "notifications": {
+            "discord_webhook": "",
+            "telegram": {"bot_token": "", "chat_id": ""},
+            "email": {"smtp_server": "smtp.gmail.com", "port": 587, "sender": "", "password": "", "recipient": ""}
+        }
+    }
+    with open("config.json", "w") as f:
+        json.dump(CONFIG, f, indent=4)
+    logging.warning("Config file created. Fill in credentials.")
+
+# SQLite setup
+conn = sqlite3.connect("keycodes.db", check_same_thread=False)
+cursor = conn.cursor()
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS keys (
+        key TEXT PRIMARY KEY,
+        platform TEXT,
+        source TEXT,
+        found_at TIMESTAMP,
+        status TEXT DEFAULT 'unclaimed'
+    )
+""")
+conn.commit()
+
+# X API setup
+auth = tweepy.OAuthHandler(CONFIG["x_api"]["api_key"], CONFIG["x_api"]["api_secret"])
+auth.set_access_token(CONFIG["x_api"]["access_token"], CONFIG["x_api"]["access_secret"])
+x_api = tweepy.API(auth, wait_on_rate_limit=True)
+
+# Proxy management
+class ProxyManager:
+    def __init__(self, proxies):
+        self.proxies = {p: {"url": p, "healthy": True, "last_checked": 0} for p in proxies}
+    
+    def get_proxy(self):
+        healthy = [p for p in self.proxies.values() if p["healthy"]]
+        return {"http": choice(healthy)["url"]} if healthy else None
+    
+    def check_proxy(self, proxy_url):
+        try:
+            requests.get("https://www.google.com", proxies={"http": proxy_url}, timeout=5)
+            self.proxies[proxy_url]["healthy"] = True
+        except requests.RequestException:
+            self.proxies[proxy_url]["healthy"] = False
+        self.proxies[proxy_url]["last_checked"] = time.time()
+
+PROXY_MANAGER = ProxyManager(CONFIG["proxies"])
+
+# Notification system
+class Notifier:
+    def __init__(self, config):
+        self.discord_webhook = config["discord_webhook"]
+        self.telegram_bot = telegram.Bot(config["telegram"]["bot_token"]) if config["telegram"]["bot_token"] else None
+        self.telegram_chat = config["telegram"]["chat_id"]
+        self.email_config = config["email"]
+    
+    def send(self, message):
+        if self.discord_webhook:
+            requests.post(self.discord_webhook, json={"content": message})
+        if self.telegram_bot:
+            asyncio.run(self.telegram_bot.send_message(chat_id=self.telegram_chat, text=message))
+        if self.email_config["sender"]:
+            msg = MIMEText(message)
+            msg["Subject"] = "New Keycodes Found"
+            msg["From"] = self.email_config["sender"]
+            msg["To"] = self.email_config["recipient"]
+            with smtplib.SMTP(self.email_config["smtp_server"], self.email_config["port"]) as server:
+                server.starttls()
+                server.login(self.email_config["sender"], self.email_config["password"])
+                server.send_message(msg)
+
+NOTIFIER = Notifier(CONFIG["notifications"])
+
+# Bot core
+class KeycodeBot:
+    def __init__(self):
+        self.websites = CONFIG["seed_websites"]
+        self.scan_interval = CONFIG["base_scan_interval"]
+        self.success_rate = 0.5  # Adjusted dynamically
+    
+    def discover_sites(self):
+        sites = set(self.websites)
+        for aggregator in CONFIG["aggregator_urls"]:
+            try:
+                response = requests.get(aggregator, headers={"User-Agent": "Mozilla/5.0"}, proxies=PROXY_MANAGER.get_proxy(), timeout=10)
+                soup = BeautifulSoup(response.text, "html.parser")
+                for link in soup.find_all("a", href=True):
+                    url = urljoin(aggregator, link["href"])
+                    if "giveaway" in url.lower() or "free" in url.lower():
+                        sites.add(url)
+            except requests.RequestException as e:
+                logging.error(f"Error discovering sites from {aggregator}: {e}")
+        self.websites = list(sites)
+
+    def scan_webpage(self, url, results):
+        try:
+            response = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, proxies=PROXY_MANAGER.get_proxy(), timeout=10)
+            text = BeautifulSoup(response.text, "html.parser").get_text()
+            keys = self.find_keycodes(text, url)
+            results[url] = keys
+            logging.info(f"Scanned {url}")
+        except requests.RequestException as e:
+            logging.error(f"Error scanning {url}: {e}")
+            results[url] = {}
+
+    def scan_x_posts(self):
+        try:
+            query = " OR ".join(CONFIG["x_keywords"]) + " -filter:retweets"
+            tweets = x_api.search_tweets(q=query, lang="en", count=50, tweet_mode="extended")
+            text = " ".join(tweet.full_text for tweet in tweets)
+            return self.find_keycodes(text, "X")
+        except tweepy.TweepyException as e:
+            logging.error(f"X API error: {e}")
+            return {}
+
+    def find_keycodes(self, text, source):
+        keys_dict = {
+            "Steam": set(re.findall(STEAM_PATTERN, text)),
+            "Xbox": set(re.findall(XBOX_PATTERN, text)),
+            "PlayStation": set(re.findall(PSN_PATTERN, text))
+        }
+        new_keys = {}
+        timestamp = datetime.now()
+        for platform, keys in keys_dict.items():
+            new_keys[platform] = []
+            for key in keys:
+                try:
+                    cursor.execute("INSERT INTO keys (key, platform, source, found_at) VALUES (?, ?, ?, ?)",
+                                  (key, platform, source, timestamp))
+                    new_keys[platform].append(key)
+                except sqlite3.IntegrityError:
+                    continue
+        conn.commit()
+        return {k: v for k, v in new_keys.items() if v}
+
+    def format_output(self, keys_dict, source):
+        output = f"New keys from {source} at {datetime.now()}:\n"
+        found_any = False
+        for platform, keys in keys_dict.items():
+            if keys:
+                found_any = True
+                output += f"\n{platform}:\n"
+                for key in keys:
+                    output += f"  - {key} ({self.validate_key(key, platform)})\n"
+        return output if found_any else f"No new keys from {source}.\n"
+
+    def validate_key(self, key, platform):
+        # Simulated validation (real APIs restricted)
+        return "possibly valid" if len(key) == {"Steam": 17, "Xbox": 29, "PlayStation": 14}[platform] else "invalid"
+
+    def adjust_interval(self, found_keys):
+        total_keys = sum(len(keys) for keys in found_keys.values())
+        self.success_rate = 0.9 * self.success_rate + 0.1 * (total_keys > 0)
+        self.scan_interval = max(60, min(3600, CONFIG["base_scan_interval"] / (self.success_rate + 0.1)))
+
+    def scan_all(self):
+        self.discover_sites()
+        results = {}
+        threads = []
+        for url in self.websites:
+            thread = threading.Thread(target=self.scan_webpage, args=(url, results))
+            threads.append(thread)
+            thread.start()
+        results["X"] = self.scan_x_posts()
+        for thread in threads:
+            thread.join()
+        
+        for proxy in PROXY_MANAGER.proxies:
+            if time.time() - PROXY_MANAGER.proxies[proxy]["last_checked"] > 3600:
+                threading.Thread(target=PROXY_MANAGER.check_proxy, args=(proxy,)).start()
+
+        for source, keys in results.items():
+            if keys:
+                formatted = self.format_output(keys, source)
+                print(formatted)
+                logging.info(formatted.strip())
+                NOTIFIER.send(formatted)
+        self.adjust_interval(results)
+
+# Flask dashboard
+app = Flask(__name__)
+bot = KeycodeBot()
+running = False
+
+@app.route("/")
+def dashboard():
+    cursor.execute("SELECT platform, COUNT(*) as count FROM keys WHERE status='unclaimed' GROUP BY platform")
+    stats = dict(cursor.fetchall())
+    return render_template("dashboard.html", stats=stats, running=running, interval=bot.scan_interval)
+
+@app.route("/start", methods=["POST"])
+def start_bot():
+    global running
+    if not running:
+        running = True
+        threading.Thread(target=run_bot, daemon=True).start()
+    return {"status": "started"}
+
+@app.route("/stop", methods=["POST"])
+def stop_bot():
+    global running
+    running = False
+    return {"status": "stopped"}
+
+def run_bot():
+    while running:
+        bot.scan_all()
+        logging.info(f"Scan complete. Next in {bot.scan_interval//60} minutes.")
+        time.sleep(bot.scan_interval)
+
+# HTML template (save as templates/dashboard.html)
+"""
+<!DOCTYPE html>
+<html>
+<head><title>Keycode Bot Dashboard</title></head>
+<body>
+    <h1>Keycode Bot Status</h1>
+    <p>Running: {{ running }}</p>
+    <p>Scan Interval: {{ interval }} seconds</p>
+    <h2>Unclaimed Keys</h2>
+    <ul>
+    {% for platform, count in stats.items() %}
+        <li>{{ platform }}: {{ count }}</li>
+    {% endfor %}
+    </ul>
+    <button onclick="fetch('/start', {method: 'POST'}).then(() => location.reload())">Start</button>
+    <button onclick="fetch('/stop', {method: 'POST'}).then(() => location.reload())">Stop</button>
+</body>
+</html>
+"""
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Keycode Scanner Bot")
+    parser.add_argument("--cli", action="store_true", help="Run in CLI mode")
+    args = parser.parse_args()
+
+    if args.cli:
+        bot = KeycodeBot()
+        try:
+            while True:
+                bot.scan_all()
+                time.sleep(bot.scan_interval)
+        except KeyboardInterrupt:
+            logging.info("Bot stopped by user.")
+            conn.close()
+    else:
+        app.run(host="0.0.0.0", port=5000)
